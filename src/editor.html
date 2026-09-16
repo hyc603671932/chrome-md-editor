@@ -119,9 +119,10 @@
             </svg>
           </button>
           <button class="toolbar-btn" id="btnHighlight" title="高亮选中文字（预览区选中后可用，可再点取消）">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 20h9"/>
-              <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect class="hl-bar" x="3" y="18" width="18" height="5" rx="1.2" stroke="none"/>
+              <path d="M14.5 2.5l6 6-7 7-6-6 7-7z"/>
+              <path d="M7.5 12.5L5 15l3 3 2.5-2.5"/>
             </svg>
           </button>
         </div>
@@ -132,6 +133,8 @@
           <button class="toolbar-btn" id="btnH1" title="一级标题">H1</button>
           <button class="toolbar-btn" id="btnH2" title="二级标题">H2</button>
           <button class="toolbar-btn" id="btnH3" title="三级标题">H3</button>
+          <button class="toolbar-btn" id="btnH4" title="四级标题">H4</button>
+          <button class="toolbar-btn" id="btnH5" title="五级标题">H5</button>
         </div>
 
         <div class="toolbar-divider"></div>
@@ -278,24 +281,6 @@
 <!-- 视图模式 -->
         <div class="toolbar-group view-mode-group">
           <button
-            class="toolbar-btn view-btn active"
-            id="btnViewSplit"
-            title="分屏模式"
-            data-mode="split"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-            >
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="12" y1="3" x2="12" y2="21" />
-            </svg>
-          </button>
-          <button
             class="toolbar-btn view-btn"
             id="btnViewEdit"
             title="纯编辑模式"
@@ -319,6 +304,24 @@
           </button>
           <button
             class="toolbar-btn view-btn"
+            id="btnViewSplit"
+            title="分屏模式"
+            data-mode="split"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <line x1="12" y1="3" x2="12" y2="21" />
+            </svg>
+          </button>
+          <button
+            class="toolbar-btn view-btn active"
             id="btnViewPreview"
             title="纯预览模式"
             data-mode="preview"
@@ -497,11 +500,22 @@
 
     <!-- 主编辑区域 -->
     <main class="editor-main" id="editorMain">
-      <!-- 文件浏览器侧边栏 -->
-      <aside class="file-sidebar" id="fileSidebar">
+      <!-- 侧边栏：大纲 / 文件 双视图 -->
+      <aside class="file-sidebar" id="fileSidebar" data-panel="outline">
         <div class="sidebar-header">
-          <span class="sidebar-title">文件</span>
+          <div class="sidebar-segmented" id="sidebarSegmented">
+            <button class="seg-btn active" id="segOutline" data-sidebar="outline">大纲</button>
+            <button class="seg-btn" id="segFiles" data-sidebar="files">文件</button>
+          </div>
           <div class="sidebar-actions">
+            <button class="sidebar-action-btn hidden" id="btnToggleUnopenable" title="只看可打开的文件">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+                <line class="eye-slash" x1="3.5" y1="3.5" x2="20.5" y2="20.5"/>
+              </svg>
+            </button>
             <button class="sidebar-action-btn" id="btnOpenFolder" title="打开文件夹">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -521,6 +535,19 @@
                 <polyline points="18,17 13,12 18,7"/>
               </svg>
             </button>
+          </div>
+        </div>
+        <div class="sidebar-content outline-content" id="outlineTree">
+          <div class="sidebar-empty">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3">
+              <line x1="8" y1="6" x2="20" y2="6"/>
+              <line x1="8" y1="12" x2="20" y2="12"/>
+              <line x1="8" y1="18" x2="20" y2="18"/>
+              <circle cx="4" cy="6" r="1.3" fill="currentColor" stroke="none"/>
+              <circle cx="4" cy="12" r="1.3" fill="currentColor" stroke="none"/>
+              <circle cx="4" cy="18" r="1.3" fill="currentColor" stroke="none"/>
+            </svg>
+            <p>文档中没有标题</p>
           </div>
         </div>
         <div class="sidebar-content" id="fileTree">

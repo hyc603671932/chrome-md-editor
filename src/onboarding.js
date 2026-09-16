@@ -98,7 +98,7 @@ export function showOnboarding(options = {}) {
           <h3>2. 编辑与预览</h3>
           <ul>
             <li>左源码 · 右预览；可切「仅编辑 / 仅预览 / 分屏」</li>
-            <li>预览区也可直接点改（WYSIWYG），改完会同步回左侧 Markdown</li>
+            <li>预览区为只读展示；选中文字后可用工具栏「高亮」按钮加标记</li>
             <li>常用语法：<code>**粗**</code> <code>*斜*</code> <code>~~删~~</code> <code>\`代码\`</code> <code># 标题</code></li>
           </ul>
         </section>
@@ -197,7 +197,7 @@ function loadExampleFile() {
 
 左右分屏：左写 Markdown，右看渲染。也可以切到「仅编辑 / 仅预览」。
 
-预览区可以直接点文字改（WYSIWYG），失焦后会写回左侧源码。
+预览区为只读展示，改动请回到左侧源码。在预览区选中文字后，用工具栏「高亮」按钮可以加标记并写回源码。
 
 ## 本地图片（重要）
 

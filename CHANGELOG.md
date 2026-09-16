@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 Format based on Keep a Changelog.
 Project uses Semantic Versioning.
 
+## [1.4.4] - 2026-09-16
+
+### Added
+
+- 重新设计预览区「框选-高亮」方案：在 DOMPurify 钩子中放行 `data-source-line` / `data-source-line-end` 行锚点（需 `forceKeepAttr`），并改用「渲染文本与源码逐字符相等 → 偏移量恒等映射」精确定位（`locateSelectionInBlock`），支持跨多行、重复文本、加粗/斜体内部选区，整段选中已高亮块可一键取消
+- 文件树新增「眼镜」过滤按钮：只看可打开的 Markdown/文本文件，及其后代仍含可打开文件的目录；自底向上剪枝（不保留空壳文件夹），过滤状态持久化，切换时复用扫描缓存不重新遍历
+- 新增 `src/file-tree.js`（`isOpenableFile` / `pruneNonOpenable` 纯函数，可单测），统一三处散落的文件类型判定（文件树 / 打开按钮 / 拖拽，均含 `.txt`），消除口径不一致
+
+### Changed
+
+- 限制预览视图下的编辑行为：预览区不再做 WYSIWYG 回写源码，改为只读，仅保留「高亮」作为唯一可写操作，从源头避免脏 DOM 累加与格式重排；高亮失败提示改为两行居中（主提示 + `G码--原因`）
+- 重新设计左侧功能区：大纲与文件双视图切换，文件视图支持文件夹浏览并可在选中文件夹时显示眼镜过滤按钮（单个文件打开时不显示）
+- 顶部视图模式按钮顺序调整为「纯编辑 → 分屏 → 纯预览」，默认进入纯预览，且不再持久化记忆（每次打开固定纯预览）
+- 高亮后预览区保持滚动位置，不再回顶
+
+### Notes
+
+- 高亮写回源码的方式：在选区对应 Markdown 源码处包裹 `<mark>…</mark>`，预览区通过行锚点 + 偏移映射反查源码区间；切换过滤不重新扫描目录
+- 早期遗留的 `src/outline.js`（孤儿模块，未被引用）已删除
+
 ## [1.4.3] - 2026-08-21
 
 ### Security

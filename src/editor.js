@@ -28,12 +28,13 @@ import { resolvePreviewLinkClickTarget } from './link-support.js';
 import { showOnboarding, hideOnboarding } from './onboarding.js';
 import { initFeedbackButton } from './feedback.js';
 import { rememberLastFile, loadLastFile } from './session-restore.js';
-import { htmlToMarkdown } from './html-to-markdown.js';
 import { newInstanceId, pendingFileStorageKey } from './instance-id.js';
+import { isOpenableFile, pruneNonOpenable, OPENABLE_EXTENSIONS } from './file-tree.js';
 import {
   selectionInsideRoot,
-  toggleMarkOnRange,
+  locateSelectionInBlock,
 } from './preview-format.js';
+import { parseOutline, outlineSignature, buildOutlineList, isHeadingLine } from './outline.js';
 import {
   applyPreviewTranslation,
   clearPreviewTranslations,
@@ -87,6 +88,20 @@ const PREVIEW_PURIFY_CONFIG = {
 };
 
 DOMPurify.addHook('uponSanitizeAttribute', (_node, data) => {
+  // 仅放行 markdown 源码行号标记，供预览区高亮定位使用（其余 data-* 仍按 ALLOW_DATA_ATTR:false 禁止）
+  // data-source-line：块起始行（0-based）；data-source-line-end：块结束行（0-based，exclusive）。
+  // 一个块（如段落）可能跨多行源码，选中文字未必在起始行，故需整块范围才能定位。
+  //
+  // ⚠️ 必须用 forceKeepAttr，不能只用 keepAttr：
+  // DOMPurify 的 _sanitizeAttributes 在钩子之后仍会调 _isValidAttribute 二次判定，
+  // 而 data-* 既不在 ALLOWED_ATTR 里、ALLOW_DATA_ATTR 又是 false，会被判非法并删除。
+  // 只有 forceKeepAttr 能在该判定前 continue 跳过后续所有检查（真实 Chrome 3.4.14 实测：
+  // keepAttr → 仍被剥；forceKeepAttr → 保留）。
+  if (data.attrName === 'data-source-line' || data.attrName === 'data-source-line-end') {
+    data.keepAttr = true;
+    data.forceKeepAttr = true;
+    return;
+  }
   if (data.attrName !== 'href') return;
   const v = String(data.attrValue || '').trim().toLowerCase();
   if (
@@ -116,6 +131,20 @@ const md = new MarkdownIt({
   typographer: true,
   breaks: true,
 });
+
+// 给块级 token 打上源码行号，供预览区「选中文字 → 定位源码」高亮使用。
+// token.map[0] 为 0-based 行号；该属性经 DOMPurify 钩子（见 PREVIEW_PURIFY_CONFIG 附近）放行。
+{
+  const defaultRenderToken = md.renderer.renderToken.bind(md.renderer);
+  md.renderer.renderToken = function (tokens, idx, options) {
+    const token = tokens[idx];
+    if (token.map) {
+      token.attrSet('data-source-line', String(token.map[0]));
+      token.attrSet('data-source-line-end', String(token.map[1]));
+    }
+    return defaultRenderToken(tokens, idx, options);
+  };
+}
 
 // 任务列表支持
 md.use(function taskListPlugin(md) {
@@ -154,11 +183,16 @@ let editor = null;
 let currentFileHandle = null;
 let isModified = false;
 let currentTheme = localStorage.getItem('md-editor-theme') || 'dark';
-let currentViewMode = localStorage.getItem('md-editor-view-mode') || 'split';
-let scrollSyncEnabled = true;
-let isPreviewEditing = false; // 防止预览编辑时循环更新
+// 视图模式不再记忆：每次打开固定从「纯预览」开始（用户切换只在当前会话内有效）。
+let currentViewMode = 'preview';
+localStorage.removeItem('md-editor-view-mode'); // 清掉旧版本留下的历史值
+let currentSidebarPanel = 'outline'; // 默认显示大纲视图
+let outlineDirty = false;            // 文档改动后置位，鼠标进入侧栏或切到大纲页时才刷新
+let inHeadingLine = false;          // 光标当前是否落在标题行（用于「离开标题行即刷新」）
+let lastOutlineSignature = '';       // 上次大纲指纹，未变则不重绘 DOM（防闪烁）
 let mermaidCounter = 0; // mermaid 图表 ID 计数器
-let currentFileUrl = null; // file:// 打开的 Markdown 原始地址
+let currentFileUrl = null; // file:// 打开的 Markdown 原始地址（拖入/关联打开时才有，按钮打开拿不到）
+let currentBaseName = ''; // 当前文档原始文件名（用于「保存为」默认建议名，三种打开方式统一在此记录）
 let currentDirectoryPath = null; // 相对已打开文件夹根目录的当前 Markdown 目录
 let previewObjectUrls = []; // 用于释放通过 File System Access API 生成的 blob URL
 let translateEnabled = false; // 预览区阅读翻译（双语对照，不改源码）
@@ -214,7 +248,7 @@ function createEditor() {
 - 按 \`Ctrl+S\` 保存当前文件
 - 使用工具栏快捷按钮进行格式化
 - 拖拽中间分隔条调整编辑/预览比例
-- **直接在预览区编辑内容**，修改会自动同步回源码
+- 预览区为只读展示；选中文字后可用工具栏「高亮」按钮加标记
 
 ## 支持的 Markdown 语法
 
@@ -322,6 +356,19 @@ graph LR
         updatePreview();
         updateStatus();
         markModified();
+        outlineDirty = true; // 文档被改动，等用户看大纲时再刷新（鼠标进入侧栏 / 切到大纲页）
+      }
+      // 标题行进出检测：光标跨越「标题 ↔ 普通」边界且文档有改动时，刷新一次大纲。
+      // 这样在标题里打字不会刷新，离开标题行的瞬间才刷（配合 signature 闸门不闪烁）。
+      if (update.docChanged || update.selectionSet) {
+        const head = update.state.selection.main.head;
+        const lineNo = update.state.doc.lineAt(head).number; // 1-based
+        const nowHeading = isHeadingLine(update.state.doc.toString(), lineNo);
+        const wasHeading = inHeadingLine;
+        inHeadingLine = nowHeading;
+        if (outlineDirty && wasHeading !== nowHeading) {
+          refreshOutlineIfDirty();
+        }
       }
       if (update.selectionSet) {
         updateCursorStatus();
@@ -337,6 +384,18 @@ graph LR
     parent: editorContainer,
   });
 
+  // 初始化光标所在行是否为标题行，避免首次按键误触发刷新
+  inHeadingLine = isHeadingLine(
+    editor.state.doc.toString(),
+    editor.state.doc.lineAt(editor.state.selection.main.head).number,
+  );
+
+  // 编辑器失焦时也刷新一次（覆盖「改完标题直接点编辑器外」的漏刷场景）。
+  // 用 focusout 而非 blur：blur 不冒泡，editor.dom 收不到内部 contentDOM 的失焦。
+  editor.dom.addEventListener('focusout', () => {
+    if (outlineDirty) refreshOutlineIfDirty();
+  });
+
   // 初始化预览
   updatePreview();
   updateStatus();
@@ -346,10 +405,71 @@ graph LR
 // 预览更新
 // ==========================================
 let previewUpdateTimer = null;
+// 整篇替换（打开/拖拽/会话恢复）时置 true：下次预览刷新不再保持滚动，回到顶部
+let previewScrollResetRequested = false;
+
+/**
+ * 预览重渲染前的滚动位置快照。
+ * 优先记「视口顶部所在块的 data-source-line + 相对视口偏移」——这样即使上方内容
+ * 高度发生变化（在别处编辑、图片撑开）也能保持视觉位置；找不到锚点时退回纯数值。
+ * 二分查找定位首個可见块，避免大文档里逐个 getBoundingClientRect 触发大量重排。
+ */
+function firstVisiblePreviewBlock(previewContainer) {
+  const blocks = previewContainer.querySelectorAll('[data-source-line]');
+  if (!blocks.length) return null;
+  const containerTop = previewContainer.getBoundingClientRect().top;
+  let lo = 0;
+  let hi = blocks.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (blocks[mid].getBoundingClientRect().bottom > containerTop + 1) {
+      found = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return found === -1 ? null : blocks[found];
+}
+
+function capturePreviewScroll(previewContainer) {
+  if (previewScrollResetRequested) {
+    previewScrollResetRequested = false;
+    return null;
+  }
+  const top = previewContainer.scrollTop;
+  if (top <= 0) return null;
+  const anchorEl = firstVisiblePreviewBlock(previewContainer);
+  const anchor = anchorEl
+    ? {
+        line: anchorEl.getAttribute('data-source-line'),
+        delta:
+          anchorEl.getBoundingClientRect().top -
+          previewContainer.getBoundingClientRect().top,
+      }
+    : null;
+  return { top, anchor };
+}
+
+function restorePreviewScroll(previewContainer, saved) {
+  if (!saved || !previewContainer) return;
+  if (saved.anchor && /^\d+$/.test(saved.anchor.line)) {
+    const el = previewContainer.querySelector(
+      `[data-source-line="${saved.anchor.line}"]`
+    );
+    if (el) {
+      const delta =
+        el.getBoundingClientRect().top -
+        previewContainer.getBoundingClientRect().top;
+      previewContainer.scrollTop += delta - saved.anchor.delta;
+      return;
+    }
+  }
+  previewContainer.scrollTop = saved.top;
+}
 
 function updatePreview() {
-  if (isPreviewEditing) return; // 避免预览编辑时循环
-
   // 防抖：快速输入时减少渲染次数；开启翻译时略加长，降低 API 调用频率
   clearTimeout(previewUpdateTimer);
   const delay = translateEnabled ? 450 : 80;
@@ -366,7 +486,18 @@ async function doUpdatePreview() {
   // 渲染 Mermaid 图表
   // markdown-it 会把 ```mermaid 渲染成 <pre><code class="language-mermaid">...</code></pre>
   cleanupPreviewObjectUrls();
+  const savedScroll = capturePreviewScroll(previewContainer);
   previewContainer.innerHTML = html;
+  // 立即恢复一次：消除「innerHTML 清零 scrollTop 导致的回顶闪烁」
+  restorePreviewScroll(previewContainer, savedScroll);
+
+  // 诊断：确认 data-source-line 是否真的进了预览 DOM（高亮定位的前提）
+  highlightLog('PREVIEW_UPDATED', {
+    anchors: previewContainer.querySelectorAll('[data-source-line]').length,
+    firstBlock: previewContainer.querySelector('[data-source-line]')
+      ? previewContainer.querySelector('[data-source-line]').outerHTML.slice(0, 200)
+      : null,
+  });
 
   // 查找所有 mermaid 代码块并渲染
   const mermaidBlocks = previewContainer.querySelectorAll('code.language-mermaid');
@@ -378,12 +509,17 @@ async function doUpdatePreview() {
       const { svg } = await mermaid.render(`mermaid-${mermaidCounter}`, source);
       const div = document.createElement('div');
       div.className = 'mermaid-diagram';
+      // 保留 mermaid 源码：预览区 WYSIWYG 回写时靠它还原围栏块，
+      // 否则 <pre> 被替换成图表后源码就丢了（html-to-markdown.js 会读这个属性）
+      div.dataset.mermaidSource = source;
       div.innerHTML = sanitizeMermaidSvg(svg);
       pre.replaceWith(div);
     } catch (err) {
       // 渲染失败时显示错误
       const div = document.createElement('div');
       div.className = 'mermaid-error';
+      // 渲染失败时源码更不能丢，同样挂上
+      div.dataset.mermaidSource = source;
       div.textContent = 'Mermaid 渲染错误: ' + err.message;
       pre.replaceWith(div);
     }
@@ -396,6 +532,10 @@ async function doUpdatePreview() {
   } else {
     setTranslateUiState({ active: false });
   }
+
+  // 终态纠正：mermaid / 图片 / 翻译 在上方插入会改变文档高度，
+  // 二次恢复可抵消这些异步内容带来的漂移，保持视觉位置不跳。
+  restorePreviewScroll(previewContainer, savedScroll);
 }
 
 async function getTranslateSettings() {
@@ -424,8 +564,6 @@ function setTranslateUiState({ active, busy, error, message } = {}) {
 
   if (previewContainer) {
     previewContainer.classList.toggle('translate-active', !!active);
-    // Avoid WYSIWYG round-trip while translation nodes are present
-    previewContainer.setAttribute('contenteditable', active ? 'false' : 'true');
   }
 
   if (!status) return;
@@ -529,7 +667,7 @@ async function toggleTranslateMode() {
     const previewContainer = document.getElementById('previewContainer');
     clearPreviewTranslations(previewContainer);
     setTranslateUiState({ active: false });
-    // Re-render clean preview (also restores contenteditable)
+    // Re-render clean preview
     doUpdatePreview();
     showToast('已关闭阅读翻译');
     return;
@@ -848,9 +986,9 @@ function clearCurrentDocumentContext() {
 }
 
 // ==========================================
-// 预览区可编辑（WYSIWYG）
+// 预览区选区（只读预览 + 高亮）
 // ==========================================
-// 预览区选区缓存：点工具栏时 preview 会失焦，需在 mousedown 前保住 Range
+// 预览区选区缓存：点工具栏/右键菜单时预览选区会丢，需先保住 Range
 let savedPreviewRange = null;
 
 function rememberPreviewSelection() {
@@ -868,63 +1006,368 @@ function rememberPreviewSelection() {
   }
 }
 
-function restorePreviewSelection(range) {
-  if (!range) return false;
-  const sel = window.getSelection();
-  if (!sel) return false;
+/**
+ * 高亮：仅作用于左侧编辑区选中的文字（直接在源码侧包 <mark>，不经过预览往返）。
+ * 预览区按「只读展示」原则，不允许从这里高亮，避免整篇 HTML→Markdown 往返破坏源码
+ * （mermaid 丢失、表格链接 URL 丢失、嵌套列表缩进丢失等）。
+ * 工具栏 / 右键菜单共用。
+ */
+// 预览区选区 → 源码行号定位所需的选择器与工具
+// 受保护容器：代码块 / mermaid / svg —— 选中其内部文字不做高亮，统一提示去编辑模式
+const PREVIEW_PROTECTED_SELECTOR = 'pre, code, .mermaid-diagram, .mermaid-error, svg';
+// 行内格式容器：加粗 / 斜体 / 删除线 / 链接 等。
+// 选区「完全落在同一个这样的容器内部」时允许高亮 —— 这类容器的源码标记（`**`、`*`、`[ ]( )`）
+// 只在两端，内部文字在源码中连续存在，配合 locateSelectionInBlock 的 T2 最近偏移定位是可靠的。
+// 注意：不含 mark —— 选区落在已有高亮里时要放行，否则「取消高亮」走不到 unwrap 分支。
+const PREVIEW_INLINE_ALLOWED_SELECTOR = 'strong, em, del, ins, sub, sup, a';
+// 必须拒绝的行内元素：图片 / 换行。它们是空元素，渲染文本与源码无法逐字符对齐。
+// 用「选区内容里是否包含」来判定，而不是祖先链（空元素不可能成为文本节点的祖先）。
+// 行内代码 <code> 不在此列 —— 它已经被 G1 的 PREVIEW_PROTECTED_SELECTOR 拦下
+// （代码内加 <mark> 会被渲染成字面文本，而不是高亮）。
+const PREVIEW_INLINE_BLOCKING_SELECTOR = 'img, br';
+// 已有高亮单独判定：只允许「整段选中同一个 mark」时才取消，避免产生嵌套 mark 垃圾
+const PREVIEW_MARK_SELECTOR = 'mark';
+
+function previewElementOf(node) {
+  return node && node.nodeType === 3 ? node.parentElement : node;
+}
+function previewInsideProtected(node) {
+  const el = previewElementOf(node);
+  return !!(el && el.closest(PREVIEW_PROTECTED_SELECTOR));
+}
+/** 端点最内层的「允许高亮」的行内格式容器；不在任何此类容器内则返回 null */
+function previewInlineContainer(node) {
+  const el = previewElementOf(node);
+  return el && el.closest ? el.closest(PREVIEW_INLINE_ALLOWED_SELECTOR) : null;
+}
+/** 选区内容里是否含指定选择器的元素（img / br 这类空元素只能这样判） */
+function previewRangeContains(range, selector) {
   try {
-    sel.removeAllRanges();
-    sel.addRange(range);
-    return true;
+    const frag = range.cloneContents();
+    return !!(frag && frag.querySelector && frag.querySelector(selector));
   } catch {
     return false;
   }
 }
+function previewMarkAncestor(node) {
+  const el = previewElementOf(node);
+  return el ? el.closest(PREVIEW_MARK_SELECTOR) : null;
+}
+/** 选区内容里是否含 <mark>（用于拦截「跨进/跨出已有高亮」的选区，避免嵌套 mark） */
+function previewRangeTouchesMark(range) {
+  const frag = range.cloneContents();
+  return !!(frag && frag.querySelector && frag.querySelector(PREVIEW_MARK_SELECTOR));
+}
+/**
+ * 返回选区端点所在「块」的源码行范围 [start, end)。
+ * 一个块（段落 / 列表项 / 引用等）可能跨多行源码，但渲染后只有一个带
+ * data-source-line 的元素，其 text 未必落在起始行，因此高亮定位必须搜整块范围。
+ * 找不到块锚点时返回 null。
+ */
+function previewBlockLines(node) {
+  const el = previewElementOf(node);
+  const anchor = el && el.closest('[data-source-line]');
+  if (!anchor) return null;
+  const start = parseInt(anchor.getAttribute('data-source-line'), 10);
+  if (Number.isNaN(start)) return null;
+  const endRaw = parseInt(anchor.getAttribute('data-source-line-end'), 10);
+  const end = Number.isNaN(endRaw) ? start + 1 : endRaw;
+  return { el: anchor, start, end };
+}
 
 /**
- * 在右侧预览选中文字上切换高亮；成功后同步回左侧 Markdown。
- * 工具栏 / 右键菜单共用。
+ * 测量选区端点在「块渲染文本」中的字符偏移。
+ * 用 Range 从块开头量到端点，取 toString().length —— <br> 等空元素不计入，
+ * 正好与 textContent 口径一致，从而可与源码逐字符对齐。
+ */
+function previewSelectionOffsets(blockEl, range) {
+  if (!blockEl || typeof document.createRange !== 'function') return null;
+  const measure = (node, offset) => {
+    const r = document.createRange();
+    r.selectNodeContents(blockEl);
+    try {
+      r.setEnd(node, offset);
+    } catch {
+      return -1;
+    }
+    return r.toString().length;
+  };
+  const start = measure(range.startContainer, range.startOffset);
+  const end = measure(range.endContainer, range.endOffset);
+  if (start < 0 || end < 0 || end <= start) return null;
+  return { start, end };
+}
+
+const PREVIEW_HIGHLIGHT_FAIL_MSG = '高亮设置失败，请在编辑模式中重新设置';
+
+/**
+ * 在源码 [from, to] 处包 / 取消包 <mark>。
+ * 复用同一套 CodeMirror dispatch，保证只改这几个字符、不重写整篇（无损）。
+ * 返回 'wrapped' | 'unwrapped' | 'noop'。
+ */
+// opts.collapseSelection：为 true 时不给编辑器留下选区（仅折叠成光标）。
+// 预览侧触发的高亮要传 true —— 否则左侧对应文字会被「选中」却无处可见选区。
+function applyMarkWrap(from, to, before, after, opts = {}) {
+  const docLen = editor.state.doc.length;
+  const selectedText = editor.state.sliceDoc(from, to);
+  const textBefore = editor.state.sliceDoc(Math.max(0, from - before.length), from);
+  const textAfter = editor.state.sliceDoc(to, Math.min(docLen, to + after.length));
+  if (textBefore === before && textAfter === after) {
+    const changes = [
+      { from: from - before.length, to: from, insert: '' },
+      { from: to, to: to + after.length, insert: '' },
+    ];
+    const anchorPos = from - before.length;
+    editor.dispatch({
+      changes,
+      selection: opts.collapseSelection
+        ? { anchor: anchorPos }
+        : { anchor: anchorPos, head: to - before.length },
+    });
+    return 'unwrapped';
+  } else if (selectedText) {
+    const changes = { from, to, insert: before + selectedText + after };
+    const endPos = to + before.length;
+    editor.dispatch({
+      changes,
+      selection: opts.collapseSelection
+        ? { anchor: endPos }
+        : { anchor: from + before.length, head: endPos },
+    });
+    return 'wrapped';
+  }
+  return 'noop';
+}
+
+// 高亮诊断开关：定位「总是失败」用，控制台按 [md-editor][highlight] 过滤。稳定后改为 false。
+const HIGHLIGHT_DEBUG = true;
+
+function highlightLog(...args) {
+  if (!HIGHLIGHT_DEBUG) return;
+  console.warn('[md-editor][highlight]', ...args);
+}
+
+/** 描述一个选区端点，便于在日志里看清它落在哪个元素、有没有块锚点 */
+function describePreviewNode(node) {
+  if (!node) return String(node);
+  const el = node.nodeType === 3 ? node.parentElement : node;
+  const anchor = el && el.closest ? el.closest('[data-source-line]') : null;
+  return {
+    nodeType: node.nodeType,
+    tag: el ? el.tagName : null,
+    sourceLine: anchor ? anchor.getAttribute('data-source-line') : null,
+    sourceLineEnd: anchor ? anchor.getAttribute('data-source-line-end') : null,
+    text: node.nodeType === 3 ? node.nodeValue : el ? el.textContent : '',
+  };
+}
+
+function highlightFail(guard, reason, detail) {
+  highlightLog('FAIL', guard, reason, detail);
+  // 两行：主提示 + 诊断码。showToast 检测到 \n 会加 .toast-multiline 居中排版
+  showToast(`${PREVIEW_HIGHLIGHT_FAIL_MSG}\n${guard}--${reason}`, 'error');
+  return false;
+}
+
+/**
+ * 预览区选中文字 → 在源码对应位置包 <mark>。
+ * 严格限制为「单块内、纯文本、唯一匹配」，其余情况一律失败提示，绝不走整篇 HTML→Markdown 回写。
+ */
+function highlightFromPreviewSelection(sel) {
+  highlightLog('ENTRY', {
+    hasSel: !!sel,
+    rangeCount: sel ? sel.rangeCount : null,
+    isCollapsed: sel ? sel.isCollapsed : null,
+    anchorsInDom: document.querySelectorAll('#previewContainer [data-source-line]').length,
+  });
+
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    return highlightFail('G0', '选区无效', {
+      hasSel: !!sel,
+      rangeCount: sel ? sel.rangeCount : null,
+      isCollapsed: sel ? sel.isCollapsed : null,
+    });
+  }
+  const range = sel.getRangeAt(0);
+
+  highlightLog('RANGE', {
+    selectedText: range.toString(),
+    start: describePreviewNode(range.startContainer),
+    end: describePreviewNode(range.endContainer),
+    common: describePreviewNode(range.commonAncestorContainer),
+  });
+
+  // 1. 受保护容器（代码块 / mermaid / svg）
+  if (
+    previewInsideProtected(range.startContainer) ||
+    previewInsideProtected(range.endContainer) ||
+    previewInsideProtected(range.commonAncestorContainer)
+  ) {
+    return highlightFail('G1', '受保护容器', {
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+      common: describePreviewNode(range.commonAncestorContainer),
+    });
+  }
+
+  // 2b. 已有高亮：只有「完整选中同一个 mark」才放行（走 applyMarkWrap 的 unwrap 分支 = 取消高亮）。
+  //     其余一切与已有高亮重叠的选区（部分选中 / 跨进跨出）一律拒绝，
+  //     否则会在源码里生成 <mark>...<mark>...</mark>...</mark> 这类嵌套垃圾。
+  const startMark = previewMarkAncestor(range.startContainer);
+  const endMark = previewMarkAncestor(range.endContainer);
+  const isWholeMark =
+    !!startMark && startMark === endMark && range.toString() === startMark.textContent;
+
+  // 2. 行内格式边界检查。
+  //    旧逻辑：端点父链上出现任何行内格式就一律拒绝 —— 过严，
+  //    导致 **加粗** / *斜体* 里的文字永远加不上高亮（哪怕一个 `*` 都没选中）。
+  //    新逻辑：只要选区「完全落在同一个行内格式容器内部」就放行；
+  //           只有一端有格式、或两端容器不同 → 说明跨过了格式边界（部分选中），
+  //           插进去会把 `*斜<mark>体</mark>*` 这类结构撕裂，拒绝。
+  const startInline = previewInlineContainer(range.startContainer);
+  const endInline = previewInlineContainer(range.endContainer);
+  if (startInline !== endInline) {
+    return highlightFail('G2', '选区跨越行内格式边界', {
+      selectedText: range.toString(),
+      startInline: startInline ? startInline.tagName : null,
+      endInline: endInline ? endInline.tagName : null,
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  // 2a. 选区含图片 / 换行 → 渲染文本与源码无法逐字符对齐，拒绝
+  if (previewRangeContains(range, PREVIEW_INLINE_BLOCKING_SELECTOR)) {
+    return highlightFail('G2b', '选区含图片或换行', {
+      selectedText: range.toString(),
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  // 2d. 两端都在纯文本里、但选区内部夹着行内格式（如 `x **bold** y` 整段选中）
+  //     → 选中文字在源码里并不连续（中间隔着 `**`），必然定位失败，提前给出明确原因
+  if (!startInline && previewRangeContains(range, PREVIEW_INLINE_ALLOWED_SELECTOR)) {
+    return highlightFail('G2x', '选区跨越行内格式（起止在格式之外）', {
+      selectedText: range.toString(),
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  // 2c. 自动链接（裸 URL）里插 <mark> 会破坏链接语法，拒绝
+  if (/:\/\/|www\./i.test(range.toString())) {
+    return highlightFail('G2u', '选区含裸链接', { selectedText: range.toString() });
+  }
+
+  if (!isWholeMark && (startMark || endMark || previewRangeTouchesMark(range))) {
+    return highlightFail('G2m', '选区与已有高亮重叠', {
+      selectedText: range.toString(),
+      startMark: startMark ? startMark.textContent : null,
+      endMark: endMark ? endMark.textContent : null,
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  // 3. 跨块：起止所在块不同（如从一段选到另一段）一律失败
+  const startBlock = previewBlockLines(range.startContainer);
+  const endBlock = previewBlockLines(range.endContainer);
+  if (!startBlock || !endBlock || startBlock.start !== endBlock.start) {
+    return highlightFail('G3', '块锚点缺失或跨块', {
+      startBlock,
+      endBlock,
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  // 4. 精确定位：以「选区在渲染文本中的字符偏移」为主信号，不再依赖「全文唯一匹配」。
+  //    T1 渲染文本与源码逐字符相等 → 偏移恒等映射（零歧义）；
+  //    T2/T3 无法恒等时（块内含行内格式 / 列表 / 标题标记）按行或整块取最近一匹配。
+  //    只有两处候选距离完全相同时才失败。
+  const doc = editor.state.doc;
+  const selectedText = range.toString();
+  if (!selectedText) {
+    return highlightFail('G4a', '选中文本为空', { selectedText });
+  }
+  const blockStart = Math.max(0, startBlock.start);
+  const blockEnd = Math.min(doc.lines, startBlock.end); // doc.lines 为行数，exclusive 上限
+  if (blockEnd <= blockStart) {
+    return highlightFail('G4b', '块行范围无效', {
+      blockStart,
+      blockEnd,
+      docLines: doc.lines,
+    });
+  }
+
+  const lineEntries = [];
+  for (let lineIndex = blockStart; lineIndex < blockEnd; lineIndex++) {
+    const lineObj = doc.line(lineIndex + 1); // token.map 为 0-based，CodeMirror 行号 1-based
+    lineEntries.push({ text: lineObj.text, from: lineObj.from });
+  }
+  const offsets = previewSelectionOffsets(startBlock.el, range);
+  if (!offsets) {
+    return highlightFail('G4d', '无法计算选区偏移', {
+      selectedText,
+      start: describePreviewNode(range.startContainer),
+      end: describePreviewNode(range.endContainer),
+    });
+  }
+
+  const match = locateSelectionInBlock({
+    renderedText: startBlock.el.textContent || '',
+    lineEntries,
+    selectedText,
+    selStart: offsets.start,
+    selEnd: offsets.end,
+  });
+  if (!match) {
+    return highlightFail('G4c', '无法定位到源码位置', {
+      selectedText,
+      blockStart,
+      blockEnd,
+      selStart: offsets.start,
+      selEnd: offsets.end,
+      renderedText: startBlock.el.textContent,
+      lineEntries,
+    });
+  }
+  highlightLog('LOCATED', match.mode, { match, selectedText, selStart: offsets.start });
+
+  const result = applyMarkWrap(match.from, match.to, '<mark>', '</mark>', {
+    collapseSelection: true,
+  });
+  if (result === 'noop') {
+    return highlightFail('G5', '写入源码失败', { match, selectedText, result });
+  }
+  highlightLog('OK', result, { match, selectedText });
+  showToast(result === 'wrapped' ? '已高亮' : '已取消高亮', 'success');
+  return true;
+}
+
+/**
+ * 高亮入口：工具栏 / 右键菜单共用。
+ * - 预览区有选区 → 在源码对应位置精准插入 <mark>（单块纯文本、唯一匹配才成功）
+ * - 编辑区有选区 → 直接在源码侧包 <mark>
+ * 全程不经过整篇 HTML→Markdown 回写，避免 mermaid / 表格 / 嵌套列表等结构丢失。
  */
 function applyPreviewHighlight() {
   const previewContainer = document.getElementById('previewContainer');
-  let range = savedPreviewRange;
   const sel = window.getSelection();
 
-  if ((!range || range.collapsed) && selectionInsideRoot(sel, previewContainer)) {
-    range = sel.getRangeAt(0).cloneRange();
+  if (selectionInsideRoot(sel, previewContainer)) {
+    return highlightFromPreviewSelection(sel);
   }
 
-  if (!range || range.collapsed) {
-    // 预览没有选区时：若左侧有选区，则在源码侧包 <mark>
-    const edSel = editor.state.selection.main;
-    if (edSel.from !== edSel.to) {
-      wrapSelection('<mark>', '</mark>');
-      showToast('已在源码中高亮选中文字', 'success');
-      return true;
-    }
-    showToast('请先在预览区选中文字，再点高亮', 'error');
-    return false;
+  // 左侧编辑区有选区 → 直接在源码侧包 <mark>
+  const edSel = editor.state.selection.main;
+  if (edSel.from !== edSel.to) {
+    wrapSelection('<mark>', '</mark>');
+    showToast('已在源码中高亮选中文字', 'success');
+    return true;
   }
-
-  isPreviewEditing = true;
-  previewContainer.focus();
-  restorePreviewSelection(range);
-
-  const liveSel = window.getSelection();
-  const liveRange =
-    liveSel && liveSel.rangeCount > 0 ? liveSel.getRangeAt(0) : range;
-
-  const result = toggleMarkOnRange(liveRange, previewContainer);
-  if (result === 'noop') {
-    showToast('请先在预览区选中文字，再点高亮', 'error');
-    isPreviewEditing = false;
-    return false;
-  }
-
-  savedPreviewRange = null;
-  syncPreviewToEditor(true);
-  showToast(result === 'wrapped' ? '已高亮' : '已取消高亮', 'success');
-  return true;
+  showToast('请先在预览区或编辑区选中文字，再点高亮', 'error');
+  return false;
 }
 
 function hidePreviewContextMenu() {
@@ -970,43 +1413,18 @@ function showPreviewContextMenu(clientX, clientY) {
   });
 }
 
-function initPreviewEditing() {
+function initPreviewSelection() {
   const previewContainer = document.getElementById('previewContainer');
 
-  // 使预览区可编辑
-  previewContainer.setAttribute('contenteditable', 'true');
-  previewContainer.setAttribute('spellcheck', 'true');
+  // 预览区是纯只读展示，不开 contenteditable。
+  // 以前开启 WYSIWYG 后，只要点一下预览区就会拿到焦点，失焦时整篇 innerHTML
+  // 被回写成 Markdown；mermaid 图表、表格、脚注等结构在这种往返里会被抹掉，
+  // 表现为「点一下预览区再点回编辑区，代码块就消失了」。
+  // 现在源码只由左侧编辑器改动，预览不再参与回写。
+  previewContainer.setAttribute('contenteditable', 'false');
 
-  // 编辑时：标记为正在预览编辑，防止循环更新
-  previewContainer.addEventListener('focus', () => {
-    isPreviewEditing = true;
-    previewContainer.classList.add('editing');
-  });
-
-  // 失焦时：把编辑后的 HTML 转回 Markdown，同步到编辑器并重新渲染预览
-  previewContainer.addEventListener('blur', () => {
-    // 打开右键菜单 / 点工具栏时不要立刻清掉选区同步（由那些动作自己 sync）
-    if (document.getElementById('previewContextMenu')) return;
-    if (!isPreviewEditing) return;
-    isPreviewEditing = false;
-    previewContainer.classList.remove('editing');
-    syncPreviewToEditor(true);
-  });
-
-  // 实时同步：每次输入后短延迟同步
-  let syncTimer = null;
-  previewContainer.addEventListener('input', () => {
-    clearTimeout(syncTimer);
-    syncTimer = setTimeout(() => {
-      syncPreviewToEditor();
-    }, 500);
-  });
-
-  // 记录预览选区
+  // 记录预览选区（供「高亮」使用）
   previewContainer.addEventListener('mouseup', () => {
-    rememberPreviewSelection();
-  });
-  previewContainer.addEventListener('keyup', () => {
     rememberPreviewSelection();
   });
 
@@ -1029,6 +1447,22 @@ function initPreviewEditing() {
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') hidePreviewContextMenu();
+  });
+}
+
+/**
+ * 编辑区获焦或产生选区时，作废预览选区。
+ *
+ * savedPreviewRange 只在「预览区 mouseup / 右键」时写入，标记「用户上一次文字交互发生在预览区」。
+ * 一旦用户回到编辑区操作（聚焦或框选），就把它作废，避免点高亮时把旧的预览选区当成当前选区，
+ * 从而误走进「预览区高亮」分支。现在预览区已禁止高亮，这里只是确保选区来源判断始终准确。
+ */
+function initEditorSelectionGuard() {
+  editor.contentDOM.addEventListener('focus', () => {
+    savedPreviewRange = null;
+  });
+  editor.contentDOM.addEventListener('mouseup', () => {
+    savedPreviewRange = null;
   });
 }
 
@@ -1063,31 +1497,6 @@ async function openPreviewLink(targetUrl) {
     throw new Error('浏览器阻止了新标签页');
   }
 }
-
-function syncPreviewToEditor(rerender = false) {
-  const previewContainer = document.getElementById('previewContainer');
-  const html = previewContainer.innerHTML;
-  const markdownContent = htmlToMarkdown(html);
-
-  // 仅在内容真的变了时才同步
-  const currentContent = editor.state.doc.toString();
-  if (markdownContent.trim() !== currentContent.trim()) {
-    isPreviewEditing = true; // 临时标记，避免 updatePreview 被触发
-    setEditorContent(markdownContent);
-    markModified();
-    updateStatus();
-    // 短延迟后解除标记
-    setTimeout(() => { isPreviewEditing = false; }, 120);
-  }
-
-  // 失焦时：用规范化后的 Markdown 重新渲染预览，保证预览与编辑器一致，
-  // 避免下一次编辑基于「被篡改的 contenteditable DOM」继续累加空行与漂移
-  if (rerender) {
-    doUpdatePreview();
-  }
-}
-
-// HTML→Markdown: see ./html-to-markdown.js (tested for Issue #1 / #3)
 
 // ==========================================
 // 状态栏更新
@@ -1169,7 +1578,7 @@ async function handleOpen() {
     const [fileHandle] = await window.showOpenFilePicker({
       types: [{
         description: 'Markdown 文件',
-        accept: { 'text/markdown': ['.md', '.markdown', '.mdown', '.mkd', '.mkdn'] },
+        accept: { 'text/markdown': OPENABLE_EXTENSIONS.map((ext) => `.${ext}`) },
       }],
       multiple: false,
     });
@@ -1218,7 +1627,7 @@ async function handleSave() {
 async function handleSaveAs() {
   try {
     const fileHandle = await window.showSaveFilePicker({
-      suggestedName: 'untitled.md',
+      suggestedName: currentBaseName || 'untitled.md',
       types: [{
         description: 'Markdown 文件',
         accept: { 'text/markdown': ['.md'] },
@@ -1264,10 +1673,18 @@ function setEditorContent(content) {
       insert: content,
     },
   });
+  // 整篇替换（打开文件 / 拖拽 / 会话恢复）-> 滚动回到顶部，下次预览刷新不保持位置
+  previewScrollResetRequested = true;
+  // 并立刻标记并重刷大纲（若正在看大纲）
+  outlineDirty = true;
+  refreshOutlineIfDirty();
 }
 
 function updateFilename(name) {
   document.getElementById('filename').textContent = name;
+  // 记录原始文件名，供「保存为」默认建议名使用。
+  // 特殊占位（'未打开文件'）与空值不污染，让保存为回落到 untitled.md。
+  currentBaseName = name && name !== '未打开文件' ? name : '';
 }
 
 function markModified() {
@@ -1287,35 +1704,22 @@ function markSaved() {
 // ==========================================
 function wrapSelection(before, after) {
   const sel = editor.state.selection.main;
-  const selectedText = editor.state.sliceDoc(sel.from, sel.to);
-
-  // 检查是否已经被包裹
-  const textBefore = editor.state.sliceDoc(Math.max(0, sel.from - before.length), sel.from);
-  const textAfter = editor.state.sliceDoc(sel.to, Math.min(editor.state.doc.length, sel.to + after.length));
-
-  if (textBefore === before && textAfter === after) {
-    // 已包裹 → 取消
-    editor.dispatch({
-      changes: [
-        { from: sel.from - before.length, to: sel.from, insert: '' },
-        { from: sel.to, to: sel.to + after.length, insert: '' },
-      ],
-      selection: { anchor: sel.from - before.length, head: sel.to - before.length },
-    });
-  } else if (selectedText) {
-    // 有选中文本 → 包裹
-    editor.dispatch({
-      changes: { from: sel.from, to: sel.to, insert: before + selectedText + after },
-      selection: { anchor: sel.from + before.length, head: sel.to + before.length },
-    });
-  } else {
-    // 无选中 → 插入模板
-    const placeholder = before === '**' ? '加粗文本' : before === '*' ? '斜体文本' : before === '~~' ? '删除线文本' : before === '`' ? 'code' : '文本';
-    editor.dispatch({
-      changes: { from: sel.from, insert: before + placeholder + after },
-      selection: { anchor: sel.from + before.length, head: sel.from + before.length + placeholder.length },
-    });
+  if (sel.from !== sel.to) {
+    // 有选区 → 复用源码侧包 / 取消包逻辑（highlightFromPreviewSelection 同款，保证无损）
+    applyMarkWrap(sel.from, sel.to, before, after);
+    editor.focus();
+    return true;
   }
+  // 无选中 → 插入占位模板（加粗 / 斜体 / 删除线 / 代码等）
+  const placeholder =
+    before === '**' ? '加粗文本' :
+    before === '*' ? '斜体文本' :
+    before === '~~' ? '删除线文本' :
+    before === '`' ? 'code' : '文本';
+  editor.dispatch({
+    changes: { from: sel.from, insert: before + placeholder + after },
+    selection: { anchor: sel.from + before.length, head: sel.from + before.length + placeholder.length },
+  });
   editor.focus();
   return true;
 }
@@ -1398,9 +1802,18 @@ function updateThemeIcon() {
 // ==========================================
 function setViewMode(mode) {
   currentViewMode = mode;
-  localStorage.setItem('md-editor-view-mode', mode);
 
   document.getElementById('editorMain').setAttribute('data-mode', mode);
+
+  // 切换视图时清掉拖拽分隔线写入的 inline flex：
+  // 1) 切到全编辑/全预览 -> inline 优先级高于 CSS 的 flex:1，不清除会卡在拖拽后的
+  //    比例（如 60%/40%），导致面板只占了部分宽度、其余空白、看起来「变窄」；
+  // 2) 切回左编辑右预览 -> 回到 CSS 默认的 flex:1 平分（初始中线位置），
+  //    即「拖拽只在这次 split 会话内有效，切走再切回回到初始值」。
+  const editorPanel = document.getElementById('editorPanel');
+  const previewPanel = document.getElementById('previewPanel');
+  if (editorPanel) editorPanel.style.flex = '';
+  if (previewPanel) previewPanel.style.flex = '';
 
   // 更新按钮状态
   document.querySelectorAll('.view-btn').forEach(btn => {
@@ -1410,6 +1823,106 @@ function setViewMode(mode) {
   // 切换后刷新编辑器布局
   if (editor) {
     requestAnimationFrame(() => editor.requestMeasure());
+  }
+}
+
+// ==========================================
+// 侧边栏：大纲 / 文件 视图切换 + 大纲导航
+// ==========================================
+
+/**
+ * Switch the left sidebar between the outline view and the file view.
+ * The `data-panel` attribute on the aside drives the CSS that shows/hides
+ * each panel and the "open folder" button.
+ */
+function setSidebarPanel(panel) {
+  currentSidebarPanel = panel;
+  const aside = document.getElementById('fileSidebar');
+  if (aside) aside.setAttribute('data-panel', panel);
+
+  document.querySelectorAll('#sidebarSegmented .seg-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.sidebar === panel);
+  });
+
+  // 鼠标已在侧栏内时切到大纲页，mouseenter 不会二次触发，这里补刷一次
+  if (panel === 'outline') refreshOutlineIfDirty();
+}
+
+/**
+ * Rebuild the outline list only when it is actually needed and has changed.
+ * - Not dirty -> do nothing.
+ * - Dirty but not on the outline panel -> keep dirty, refresh when shown.
+ * - Signature unchanged -> don't touch the DOM (prevents flicker).
+ */
+function refreshOutlineIfDirty() {
+  if (!outlineDirty) return;
+  if (currentSidebarPanel !== 'outline') return;
+  refreshOutline();
+}
+
+function refreshOutline() {
+  const tree = document.getElementById('outlineTree');
+  if (!tree || !editor) return;
+
+  const items = parseOutline(editor.state.doc.toString());
+  const sig = outlineSignature(items);
+  if (sig === lastOutlineSignature) {
+    outlineDirty = false;
+    return; // 大纲没变，完全不碰 DOM
+  }
+  lastOutlineSignature = sig;
+
+  const keepScroll = tree.scrollTop;
+  const frag = buildOutlineList(items, {
+    onSelect: (item) => scrollToOutlineItem(item.line),
+  });
+  tree.replaceChildren(frag); // 用 textContent 构建，避免 innerHTML 注入
+  tree.scrollTop = keepScroll;
+  outlineDirty = false;
+}
+
+/**
+ * Jump to a heading by its 0-based source line.
+ * - preview: scroll the matching [data-source-line] element into view
+ * - editor: move the cursor to that line and scroll it into view
+ * Both run when in split mode; only the visible panel(s) react otherwise.
+ */
+function scrollToOutlineItem(line) {
+  const sourceLine = Math.max(0, line | 0);
+
+  // ---- Preview side ----
+  const previewContainer = document.getElementById('previewContainer');
+  if (previewContainer && previewContainer.offsetParent !== null) {
+    const el = previewContainer.querySelector(`[data-source-line="${sourceLine}"]`);
+    if (el) {
+      const top =
+        el.getBoundingClientRect().top -
+        previewContainer.getBoundingClientRect().top +
+        previewContainer.scrollTop;
+      previewContainer.scrollTop = Math.max(0, top - 8);
+    } else {
+      // 预览可能还没渲染完（mermaid 异步 / 防抖），等一拍再试一次
+      updatePreview();
+      setTimeout(() => {
+        const retry = previewContainer.querySelector(`[data-source-line="${sourceLine}"]`);
+        if (retry) {
+          const t =
+            retry.getBoundingClientRect().top -
+            previewContainer.getBoundingClientRect().top +
+            previewContainer.scrollTop;
+          previewContainer.scrollTop = Math.max(0, t - 8);
+        }
+      }, 140);
+    }
+  }
+
+  // ---- Editor side ----
+  if (editor && document.getElementById('editorPanel').offsetParent !== null) {
+    const lineObj = editor.state.doc.line(Math.min(sourceLine + 1, editor.state.doc.lines));
+    editor.dispatch({
+      selection: { anchor: lineObj.from },
+      effects: EditorView.scrollIntoView(lineObj.from, { y: 'start' }),
+    });
   }
 }
 
@@ -1474,7 +1987,19 @@ function showToast(message, type = '') {
 
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  toast.textContent = message;
+  // 含换行的消息（如高亮失败的主提示 + 诊断码）走多行居中排版；
+  // 其余调用点不受影响，仍是原来的单行。
+  if (typeof message === 'string' && message.includes('\n')) {
+    toast.classList.add('toast-multiline');
+    for (const line of message.split('\n')) {
+      const lineEl = document.createElement('div');
+      lineEl.className = 'toast-line';
+      lineEl.textContent = line;
+      toast.appendChild(lineEl);
+    }
+  } else {
+    toast.textContent = message;
+  }
   document.body.appendChild(toast);
 
   clearTimeout(toastTimeout);
@@ -1486,40 +2011,6 @@ function showToast(message, type = '') {
     toast.classList.remove('show');
     setTimeout(() => toast.remove(), 300);
   }, 2500);
-}
-
-// ==========================================
-// 滚动同步
-// ==========================================
-function initScrollSync() {
-  const editorContainer = document.getElementById('editorContainer');
-  const previewContainer = document.getElementById('previewContainer');
-
-  // 简单比例同步
-  const editorScroller = editorContainer.querySelector('.cm-scroller');
-  if (!editorScroller) return;
-
-  let isSyncing = false;
-
-  editorScroller.addEventListener('scroll', () => {
-    if (!scrollSyncEnabled || isSyncing || currentViewMode !== 'split') return;
-    isSyncing = true;
-
-    const scrollPercent = editorScroller.scrollTop / (editorScroller.scrollHeight - editorScroller.clientHeight || 1);
-    previewContainer.scrollTop = scrollPercent * (previewContainer.scrollHeight - previewContainer.clientHeight);
-
-    requestAnimationFrame(() => { isSyncing = false; });
-  });
-
-  previewContainer.addEventListener('scroll', () => {
-    if (!scrollSyncEnabled || isSyncing || currentViewMode !== 'split') return;
-    isSyncing = true;
-
-    const scrollPercent = previewContainer.scrollTop / (previewContainer.scrollHeight - previewContainer.clientHeight || 1);
-    editorScroller.scrollTop = scrollPercent * (editorScroller.scrollHeight - editorScroller.clientHeight);
-
-    requestAnimationFrame(() => { isSyncing = false; });
-  });
 }
 
 // ==========================================
@@ -1562,6 +2053,8 @@ function bindEvents() {
   document.getElementById('btnH1').addEventListener('click', () => insertAtLineStart('# '));
   document.getElementById('btnH2').addEventListener('click', () => insertAtLineStart('## '));
   document.getElementById('btnH3').addEventListener('click', () => insertAtLineStart('### '));
+  document.getElementById('btnH4').addEventListener('click', () => insertAtLineStart('#### '));
+  document.getElementById('btnH5').addEventListener('click', () => insertAtLineStart('##### '));
 
   // 列表和引用
   document.getElementById('btnUL').addEventListener('click', () => insertAtLineStart('- '));
@@ -1655,7 +2148,7 @@ function bindEvents() {
     const files = e.dataTransfer.files;
     if (files.length > 0) {
       const file = files[0];
-      if (file.name.endsWith('.md') || file.name.endsWith('.markdown') || file.name.endsWith('.txt')) {
+      if (isOpenableFile(file.name)) {
         const content = await file.text();
         setEditorContent(content);
         updateFilename(file.name);
@@ -1800,10 +2293,33 @@ function blobToDataUrl(blob) {
 let directoryHandle = null;
 let isSidebarCollapsed = localStorage.getItem('md-sidebar-collapsed') === 'true';
 
+// 文件树过滤：睁眼(true) = 显示全部；带斜线(false) = 只看可打开的文件。持久化。
+let showUnopenable = localStorage.getItem('md-file-tree-show-unopenable') !== 'false';
+// 最近一次扫描结果。点眼镜只重渲染、不重新遍历目录（大文件夹下避免卡顿）。
+let fileTreeEntries = null;
+// 按 path 记住展开过的目录，重渲染后还原。
+// 睁眼态与过滤态各存一份：过滤态只自动展开第一层，若共用一份，
+// 睁眼态手动展开的深层目录会在切到过滤态后仍保持展开，看起来就像「嵌套被自动打开了」。
+const expandedDirs = new Set();
+const expandedDirsFiltered = new Set();
+
+/** 眼镜按钮只在「已打开文件夹」时才有意义（只打开单个文件时没有文件树可过滤） */
+function updateEyeButtonVisibility() {
+  const btn = document.getElementById('btnToggleUnopenable');
+  if (!btn) return;
+  btn.classList.toggle('hidden', !directoryHandle);
+  btn.classList.toggle('filtering', !showUnopenable);
+  btn.title = showUnopenable ? '只看可打开的文件' : '显示全部文件';
+}
+
 async function handleOpenFolder() {
   try {
     directoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-    await renderFileTree();
+    fileTreeEntries = null;
+    expandedDirs.clear();
+    expandedDirsFiltered.clear();
+    updateEyeButtonVisibility();
+    await renderFileTree({ rescan: true });
     showToast(`已打开文件夹: ${directoryHandle.name}`, 'success');
   } catch (err) {
     if (err.name !== 'AbortError') {
@@ -1837,14 +2353,20 @@ async function readDirectoryRecursive(dirHandle, depth = 0, parentPath = '') {
   return entries;
 }
 
-async function renderFileTree() {
+async function renderFileTree({ rescan = false } = {}) {
   const container = document.getElementById('fileTree');
   if (!directoryHandle) return;
 
   container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:12px;text-align:center;">加载中...</div>';
 
   try {
-    const entries = await readDirectoryRecursive(directoryHandle);
+    // 只有「打开文件夹 / 刷新」才真正遍历目录；切过滤态复用缓存
+    if (rescan || !fileTreeEntries) {
+      fileTreeEntries = await readDirectoryRecursive(directoryHandle);
+    }
+    const entries = showUnopenable
+      ? fileTreeEntries
+      : pruneNonOpenable(fileTreeEntries);
     container.innerHTML = '';
 
     // 根目录标题
@@ -1867,6 +2389,20 @@ async function renderFileTree() {
     container.appendChild(rootDiv);
 
     renderTreeEntries(container, entries, 1);
+
+    // 过滤态下整棵树可能被剪空，给个明确提示而不是留一个孤零零的根目录
+    if (entries.length === 0) {
+      const emptyDiv = document.createElement('div');
+      emptyDiv.className = 'sidebar-empty';
+      emptyDiv.style.height = 'auto';
+      emptyDiv.style.padding = '16px 20px';
+      const p = document.createElement('p');
+      p.textContent = showUnopenable
+        ? '此文件夹为空'
+        : '此文件夹没有可打开的文件';
+      emptyDiv.appendChild(p);
+      container.appendChild(emptyDiv);
+    }
   } catch (err) {
     container.replaceChildren();
     const errorDiv = document.createElement('div');
@@ -1913,12 +2449,25 @@ function renderDirectoryNode(parent, entry, depth) {
     renderTreeEntries(childrenDiv, entry.children, depth + 1);
   }
 
+  // 展开状态：
+  // - 过滤态（带斜线）只自动展开第一层（depth === 1），嵌套文件夹保持折叠，用户点开才算数；
+  // - 睁眼态按各自记录还原，避免切一下过滤就把手动展开的目录全折叠回去。
+  const expanded =
+    (!showUnopenable && depth === 1) ||
+    (showUnopenable ? expandedDirs : expandedDirsFiltered).has(entry.path);
+  if (expanded) {
+    chevronEl.classList.add('expanded');
+    childrenDiv.classList.add('expanded');
+  }
+
   // 点击展开/折叠
   itemDiv.addEventListener('click', (e) => {
     e.stopPropagation();
-    const chevron = itemDiv.querySelector('.tree-item-chevron');
-    chevron.classList.toggle('expanded');
-    childrenDiv.classList.toggle('expanded');
+    const nowExpanded = childrenDiv.classList.toggle('expanded');
+    chevronEl.classList.toggle('expanded', nowExpanded);
+    const memory = showUnopenable ? expandedDirs : expandedDirsFiltered;
+    if (nowExpanded) memory.add(entry.path);
+    else memory.delete(entry.path);
   });
 
   parent.appendChild(itemDiv);
@@ -1930,7 +2479,7 @@ function renderFileNode(parent, entry, depth) {
   itemDiv.className = 'tree-item';
   itemDiv.style.paddingLeft = `${depth * 16 + 24}px`; // 多缩进一点，对齐文件夹下的文件
 
-  const isMarkdown = /\.(md|markdown|mdown|mkd|mkdn|txt)$/i.test(entry.name);
+  const isMarkdown = isOpenableFile(entry.name);
   const iconColor = isMarkdown ? 'var(--accent)' : 'var(--text-muted)';
   const iconEl = document.createElement('span');
   iconEl.className = 'tree-item-icon';
@@ -2012,18 +2561,48 @@ function initFileSidebar() {
   // 打开文件夹
   document.getElementById('btnOpenFolder').addEventListener('click', handleOpenFolder);
 
-  // 刷新
+  // 刷新：大纲视图 -> 刷新大纲；文件视图 -> 刷新文件树
   document.getElementById('btnRefreshTree').addEventListener('click', async () => {
+    if (currentSidebarPanel === 'outline') {
+      lastOutlineSignature = ''; // 强制重算
+      refreshOutline();
+      showToast('大纲已刷新', 'success');
+      return;
+    }
     if (directoryHandle) {
-      await renderFileTree();
+      fileTreeEntries = null;
+      await renderFileTree({ rescan: true });
       showToast('文件树已刷新', 'success');
     } else {
       showToast('请先打开一个文件夹', 'error');
     }
   });
 
+  // 眼镜：睁眼(显示全部) <-> 带斜线(只看可打开的文件)。
+  // 只重渲染，不重新遍历目录 —— 大文件夹下避免每次切换都卡一下。
+  const eyeBtn = document.getElementById('btnToggleUnopenable');
+  if (eyeBtn) {
+    eyeBtn.addEventListener('click', async () => {
+      showUnopenable = !showUnopenable;
+      localStorage.setItem('md-file-tree-show-unopenable', String(showUnopenable));
+      updateEyeButtonVisibility();
+      await renderFileTree();
+    });
+    updateEyeButtonVisibility(); // 初始态：没打开文件夹时隐藏
+  }
+
   // 收起侧边栏
   document.getElementById('btnCollapseSidebar').addEventListener('click', () => toggleSidebar(true));
+
+  // 大纲 / 文件 SegmentedControl
+  document.querySelectorAll('#sidebarSegmented .seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setSidebarPanel(btn.dataset.sidebar));
+  });
+
+  // 鼠标进入左侧栏 / 键盘聚焦 -> 若有改动则刷新大纲（用户的意图驱动刷新策略）
+  const sidebar = document.getElementById('fileSidebar');
+  sidebar.addEventListener('mouseenter', refreshOutlineIfDirty);
+  sidebar.addEventListener('focusin', refreshOutlineIfDirty);
 
   // 添加侧边栏展开的 toggle bar
   const editorMain = document.getElementById('editorMain');
@@ -2039,6 +2618,10 @@ function initFileSidebar() {
   if (isSidebarCollapsed) {
     toggleSidebar(true);
   }
+
+  // 初始构建大纲（默认显示大纲视图）
+  setSidebarPanel('outline');
+  refreshOutlineIfDirty();
 }
 function init() {
   // Stamp version so we can confirm Chrome loaded the new package
@@ -2069,8 +2652,9 @@ function init() {
   // 初始化分屏拖拽
   initResizer();
 
-  // 初始化预览区可编辑
-  initPreviewEditing();
+  // 初始化预览区交互（只读）
+  initPreviewSelection();
+  initEditorSelectionGuard();
   initPreviewLinkNavigation();
 
   // 初始化编辑区图片粘贴
@@ -2098,9 +2682,6 @@ function init() {
 
   // 恢复视图模式
   setViewMode(currentViewMode);
-
-  // 延迟初始化滚动同步(等待 CM 挂载完成)
-  setTimeout(initScrollSync, 200);
 
   // 检查是否有从 content script 传入的 pending file
   loadPendingFile();

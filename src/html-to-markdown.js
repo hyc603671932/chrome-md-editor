@@ -177,8 +177,12 @@ export function convertNode(node) {
     case 'input':
       return '';
     case 'div': {
-      if (node.classList.contains('mermaid-diagram')) {
-        return '';
+      // mermaid 图：预览渲染时已把源码挂在 data-mermaid-source 上（editor.js），
+      // 这里还原成围栏代码块；此前直接 return '' 会导致点一下预览区源码就没了。
+      // 渲染成功/失败两种情况都挂了这个属性，故用属性存在性判断而非 classList。
+      const mermaidSrc = node.getAttribute('data-mermaid-source');
+      if (mermaidSrc !== null) {
+        return '```mermaid\n' + mermaidSrc.replace(/\s+$/, '') + '\n```\n\n';
       }
       return childText;
     }

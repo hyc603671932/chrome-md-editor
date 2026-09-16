@@ -554,6 +554,14 @@ body {
   background: color-mix(in srgb, #f2cc60 70%, transparent);
 }
 
+#btnHighlight .hl-bar {
+  fill: #e3b341;
+}
+
+[data-theme="light"] #btnHighlight .hl-bar {
+  fill: #f2cc60;
+}
+
 /* 预览区右键菜单：只保留高亮，干净克制 */
 .preview-context-menu {
   position: fixed;
@@ -934,6 +942,17 @@ body {
   transform: translateX(-50%) translateY(0);
 }
 
+/* 多行 toast（高亮失败：主提示 + 诊断码）—— 两行整体居中对齐 */
+.toast-multiline {
+  text-align: center;
+  line-height: 1.6;
+  max-width: 90vw;
+}
+
+.toast-line {
+  white-space: nowrap;
+}
+
 .toast.success {
   border-color: var(--success);
   background: rgba(63, 185, 80, 0.1);
@@ -1007,39 +1026,6 @@ body {
   color: var(--danger);
   font-size: 13px;
   font-family: var(--font-mono);
-}
-
-/* ==========================================
-   Preview Editable State
-   ========================================== */
-.preview-container[contenteditable="true"] {
-  outline: none;
-  cursor: text;
-}
-
-.preview-container[contenteditable="true"]:focus {
-  outline: none;
-}
-
-.preview-container.editing {
-  box-shadow: inset 0 0 0 2px var(--accent-glow);
-  border-radius: var(--radius-sm);
-}
-
-.preview-container.editing::after {
-  content: '编辑中 — 点击外部区域完成';
-  position: sticky;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  display: block;
-  padding: 6px 12px;
-  font-size: 11px;
-  color: var(--text-muted);
-  background: var(--bg-tertiary);
-  border-top: 1px solid var(--border-subtle);
-  text-align: center;
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
 }
 
 /* ==========================================
@@ -1131,6 +1117,95 @@ body {
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* Sidebar Segmented Control (大纲 / 文件) */
+.sidebar-segmented {
+  display: flex;
+  align-items: center;
+  background: var(--bg-active, rgba(128,128,128,0.18));
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.seg-btn {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: calc(var(--radius-sm) - 2px);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.seg-btn:hover {
+  color: var(--text-primary);
+}
+
+.seg-btn.active {
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.15));
+}
+
+/* Two panels are mutually exclusive, driven by aside[data-panel] */
+.file-sidebar[data-panel="outline"] #fileTree { display: none; }
+.file-sidebar[data-panel="files"] #outlineTree { display: none; }
+
+/* 眼镜按钮：默认睁眼；.filtering 时补一条左上→右下的斜线 */
+.eye-slash { display: none; }
+#btnToggleUnopenable.filtering .eye-slash { display: block; }
+#btnToggleUnopenable.filtering { color: var(--accent); }
+
+/* 大纲视图 / 未打开文件夹时都隐藏（打开单个文件时没有文件树可过滤） */
+.file-sidebar[data-panel="outline"] #btnToggleUnopenable { display: none; }
+#btnToggleUnopenable.hidden { display: none; }
+
+/* Requirement 4: hide the "open folder" button while on the outline view */
+.file-sidebar[data-panel="outline"] #btnOpenFolder { display: none; }
+
+.outline-content { padding-top: 6px; }
+
+.outline-item {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  border-radius: 0;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  user-select: none;
+}
+
+.outline-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.outline-item.active {
+  background: var(--bg-active);
+  color: var(--text-accent);
+}
+
+.outline-item-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Indentation by heading level (1-based -> 12/26/40/54/68/82px) */
+.outline-h1 { padding-left: 12px; font-weight: 700; color: var(--text-primary); }
+.outline-h2 { padding-left: 26px; }
+.outline-h3 { padding-left: 40px; }
+.outline-h4 { padding-left: 54px; }
+.outline-h5 { padding-left: 68px; }
+.outline-h6 { padding-left: 82px; }
 
 /* File Tree Items */
 .tree-item {
